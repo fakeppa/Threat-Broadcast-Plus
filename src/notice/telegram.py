@@ -1,17 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # -----------------------------------------------
-# Telegram 频道推送：威胁情报完整播报（漏洞库模式 v3）
+# Telegram 频道推送：威胁情报完整播报（漏洞库模式 v4）
 #
-#   1. AI 研判：直接从 https://threat.aabyss.cn/ 抓最新研判全文
-#   2. 漏洞条目：推送描述全文（info 字段，数据库/爬虫已带）
-#   3. 全量推送不折叠，按危害等级排序
-#   4. 超 4096 自动分片，429 限流自动重试
-#   5. HTML 转义防注入，解析失败降级纯文本
+#   1. AI 研判：实时从 https://threat.aabyss.cn/ 抓全文
+#   2. 单条消息合并发送（标题+AI+漏洞条目拼一块），
+#      只有真超 4096 才分片；正常批次一律一条
+#   3. 每条带 POC/EXP 字段：本地启发式判定（标题/描述/URL 关键词）
+#   4. 按危害等级排序，HTML 转义，429 限流重试
 # -----------------------------------------------
 
-import json
-import os
 import re
 import time
 import requests
@@ -22,7 +20,6 @@ from src.bean.cve_info import CST, LEVEL_CN
 from src.logger import log
 
 PAGE_URL = 'https://threat.aabyss.cn/'
-MSG_LIMIT = 4096
 SAFE_LIMIT = 3800
 SLEEP_BETWEEN = 0.6
 AI_FETCH_TIMEOUT = 20
@@ -37,6 +34,28 @@ BADGE = {
 }
 LEVEL_RANK = {'KEV': 0, 'CRITICAL': 1, 'HIGH': 2, 'MEDIUM': 3, 'LOW': 4, '': 5}
 
+# ---- POC/EXP 启发式关键词（不区分大小写） ----
+_POC_RE = re.compile(
+    r'(poc|proof[- ]of[- ]concept|exploit|exp\b|\bexp\)|weaponiz|'
+    r'利用代码|漏洞利用|利用程序|概念验证|在野利用|exp 已公开)',
+    re.IGNORECASE)
+# URL 里带这些特征也算（如 exp 库/GitHub exploit 仓库）
+_POC_URL_RE = re.compile(
+    r'(exploit[-_]?db|exploit\.db|github\.com/[^/]+/[Pp][Oo][Cc]|poc\.|'
+    r'exploit/|/exploits/|packetstorm|seclists|vulners)',
+    re.IGNORECASE)
+
+
+def _has_poc(cve):
+    """本地启发式：标题/描述/URL 任一命中即判有 POC。"""
+    title = (getattr(cve, 'title', '') or '')
+    info = (getattr(cve, 'info', '') or '')
+    url = (getattr(cve, 'url', '') or '')
+    if _POC_URL_RE.search(url):
+        return True
+    text = title + ' ' + info
+    return bool(_POC_RE.search(text))
+
 
 def to_telegram(cves):
     if not cves:
@@ -49,16 +68,8 @@ def to_telegram(cves):
         log.debug('[Telegram] 未配置推送渠道，跳过')
         return False
 
-    sent_any = False
-
-    # ---- 消息 1：AI 研判（从看板爬全文） ----
-    ai = _fetch_ai_from_page()
-    if ai:
-        ai_msg = '<b>🤖 AI 研判 | 近期高风险漏洞</b>\n<blockquote>%s</blockquote>' % _esc(ai)
-        sent_any = _send(bot_token, chat_id, ai_msg) or sent_any
-
-    # ---- 消息 2..N：完整播报分片（含漏洞全文描述） ----
     chunks = build_chunks(cves)
+    sent_any = False
     for idx, chunk in enumerate(chunks):
         ok = _send(bot_token, chat_id, chunk, seq=(idx + 1, len(chunks)))
         sent_any = sent_any or ok
@@ -78,7 +89,6 @@ _AI_SUMMARY_RE = re.compile(
 
 
 def _fetch_ai_from_page():
-    """从 threat.aabyss.cn 首页抓取 ai-summary-text 段落全文。"""
     try:
         resp = requests.get(PAGE_URL, timeout=AI_FETCH_TIMEOUT, headers={
             'User-Agent': 'Mozilla/5.0 (compatible; ThreatBroadcast/1.0)',
@@ -91,7 +101,6 @@ def _fetch_ai_from_page():
         if not match:
             log.info('[Telegram] 看板上没有 AI 研判段落，跳过')
             return ''
-        # 去掉 HTML 标签与实体，拿到纯文本
         raw = match.group(1)
         text = re.sub(r'<br\s*/?>', '\n', raw)
         text = re.sub(r'<[^>]+>', '', text)
@@ -122,41 +131,38 @@ def _fallback_url(cve):
     return ''
 
 
-def _render_entry(src_name, cve):
+def _render_entry(cve):
     level = (getattr(cve, 'level', '') or '').upper()
     badge = BADGE.get(level, '▫️')
     level_cn = LEVEL_CN.get(level, '未知')
+    poc = _has_poc(cve)
+    poc_mark = ' <b>💣[POC]</b>' if poc else ''
 
-    title = _esc((getattr(cve, 'title', '') or '').strip()[:200])
+    title = _esc((getattr(cve, 'title', '') or '').strip()[:160])
     cid = _esc(getattr(cve, 'id', '') or '详情')
-    time_str = _esc((getattr(cve, 'time', '') or '')[:16])
+    time_str = _esc((getattr(cve, 'time', '') or '')[:10])
     url = _fallback_url(cve)
 
-    # 描述全文（info 字段），去 HTML 标签已由 normalize 保证
     info_raw = (getattr(cve, 'info', '') or '').strip()
-    info = _esc(info_raw[:500]) if info_raw and info_raw != (getattr(cve, 'title', '') or '') else ''
+    if info_raw == (getattr(cve, 'title', '') or ''):
+        info_raw = ''
+    info = _esc(info_raw[:300]) if info_raw else ''
 
-    lines = []
-    head = '%s <b>[%s]</b> %s' % (badge, level_cn, title)
     if url:
-        head = '<a href="%s">%s</a> %s' % (url, cid, head)
+        head = '<a href="%s">%s</a> %s%s <b>[%s]</b>' % (url, cid, badge, poc_mark, level_cn)
     else:
-        head = '%s %s' % (cid, head)
-    lines.append(head)
-    lines.append('　%s · %s' % (cid if not url else _esc(src_name), time_str))
+        head = '%s %s%s <b>[%s]</b>' % (cid, badge, poc_mark, level_cn)
+    line = head + ' ' + title + '\n　' + time_str
     if info:
-        lines.append('<i>%s</i>' % info)
-    return '\n'.join(lines)
+        line += '\n　<i>%s</i>' % info
+    return line
 
 
 def build_chunks(cves):
     total = _total(cves)
     now = datetime.now(CST).strftime('%Y-%m-%d %H:%M')
 
-    header = [
-        '<b>🛡 Threat Broadcast | 漏洞库播报</b>',
-        '新增 <b>%d</b> 条 · %s' % (total, now),
-    ]
+    ai = _fetch_ai_from_page()
 
     flat = []
     for src, items in cves.items():
@@ -168,24 +174,36 @@ def build_chunks(cves):
     last_src = None
     for src_name, cve in flat:
         if src_name != last_src:
-            body_lines.append('')
-            body_lines.append('<b>━━ %s ━━</b>' % _esc(src_name))
+            body_lines.append('<b>—— %s ——</b>' % _esc(src_name))
             last_src = src_name
-        body_lines.append(_render_entry(src_name, cve))
+        body_lines.append(_render_entry(cve))
 
-    # ---- 分片组装 ----
-    chunks = []
-    current = header[0] + '\n' + header[1]
+    # ---- 单块组装（正常批次一条搞定） ----
+    header = '<b>🛡 Threat Broadcast · %s</b>\n新增 <b>%d</b> 条' % (now, total)
+    if ai:
+        header += '\n🤖 <b>AI 研判：</b>' + _esc(ai)
+
+    current = header
     for line in body_lines:
         candidate = current + '\n' + line
-        if len(candidate) > SAFE_LIMIT and len(current.strip()) > 0:
-            current += '\n<i>接下页…</i>'
-            chunks.append(current)
+        if len(candidate) > SAFE_LIMIT:
+            current += '\n<i>…接下页</i>'
+            chunks_done = current
+            # 用 list 暂存，见下
+            if not hasattr(build_chunks, '_acc'):
+                build_chunks._acc = []
+            build_chunks._acc.append(chunks_done)
             current = line
         else:
             current = candidate
-    current += '\n\n<a href="%s">🌐 完整网页版</a>' % PAGE_URL
-    chunks.append(current)
+    current += '\n<a href="%s">🌐 网页版</a>' % PAGE_URL
+
+    if hasattr(build_chunks, '_acc') and build_chunks._acc:
+        build_chunks._acc.append(current)
+        chunks = build_chunks._acc
+        del build_chunks._acc
+    else:
+        chunks = [current]
 
     if len(chunks) > 1:
         numbered = []
@@ -198,7 +216,6 @@ def build_chunks(cves):
             else:
                 numbered.append(tag + chunk)
         chunks = numbered
-
     return chunks
 
 
