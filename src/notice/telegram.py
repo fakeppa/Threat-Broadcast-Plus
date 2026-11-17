@@ -131,7 +131,7 @@ def _fallback_url(cve):
     return ''
 
 
-def _render_entry(cve):
+def _render_entry(cve, src_label=''):
     level = (getattr(cve, 'level', '') or '').upper()
     badge = BADGE.get(level, '▫️')
     level_cn = LEVEL_CN.get(level, '未知')
@@ -143,10 +143,11 @@ def _render_entry(cve):
     time_str = _esc((getattr(cve, 'time', '') or '')[:10])
     url = _fallback_url(cve)
 
+    # 描述全文：normalize 上限 1200 字，这里只截到 900 控制单条体积
     info_raw = (getattr(cve, 'info', '') or '').strip()
     if info_raw == (getattr(cve, 'title', '') or ''):
         info_raw = ''
-    info = _esc(info_raw[:300]) if info_raw else ''
+    info = _esc(info_raw[:900]) if info_raw else ''
 
     if url:
         head = '<a href="%s">%s</a> %s%s <b>[%s]</b>' % (url, cid, badge, poc_mark, level_cn)
@@ -158,25 +159,71 @@ def _render_entry(cve):
     return line
 
 
+def _merge_entries(cves):
+    """跨源合并同一 CVE：保留等级最高的一条记录，描述取所有源里最长的。
+
+    斗象/微步等中文源常只有一句话，NVD/CISA 有完整技术描述；
+    合并后标题用等级最高记录的，描述用最长的，来源标注列出全部。
+    """
+    merged = {}
+    for src, items in cves.items():
+        for cve in items:
+            cid = (getattr(cve, 'id', '') or '').upper()
+            key = cid if cid.startswith('CVE-') else '%s|%s' % (
+                src.NAME_CH(), getattr(cve, 'title', ''))
+            level = (getattr(cve, 'level', '') or '').upper()
+            rank = LEVEL_RANK.get(level, 5)
+
+            if key not in merged:
+                merged[key] = {
+                    'cve': cve, 'rank': rank, 'level': level,
+                    'sources': [src.NAME_CH()],
+                }
+            else:
+                entry = merged[key]
+                if src.NAME_CH() not in entry['sources']:
+                    entry['sources'].append(src.NAME_CH())
+                # 等级更高的记录优先作为主条目（KEV 标记不能丢）
+                if rank < entry['rank']:
+                    old_info = getattr(entry['cve'], 'info', '') or ''
+                    new_info = (getattr(cve, 'info', '') or '')
+                    entry['cve'] = cve
+                    entry['rank'] = rank
+                    entry['level'] = level
+                    # 主条目换了但描述短的，保留原来的长描述
+                    if len(new_info) < len(old_info):
+                        setattr(entry['cve'], 'info', old_info)
+                else:
+                    # 主条目不变，描述取更长的
+                    old_info = (getattr(entry['cve'], 'info', '') or '')
+                    new_info = (getattr(cve, 'info', '') or '')
+                    if len(new_info) > len(old_info):
+                        setattr(entry['cve'], 'info', new_info)
+    return merged
+
+
 def build_chunks(cves):
-    total = _total(cves)
+    total_raw = _total(cves)
     now = datetime.now(CST).strftime('%Y-%m-%d %H:%M')
 
     ai = _fetch_ai_from_page()
 
-    flat = []
-    for src, items in cves.items():
-        for cve in items:
-            flat.append((src.NAME_CH(), cve))
-    flat.sort(key=lambda pair: LEVEL_RANK.get((pair[1].level or '').upper(), 5))
+    merged = _merge_entries(cves)
+    # 按等级排序，同级按编号倒序（新的在前）
+    flat = sorted(merged.items(), key=lambda kv: (
+        kv[1]['rank'], getattr(kv[1]['cve'], 'time', ''), kv[0]))
 
     body_lines = []
-    last_src = None
-    for src_name, cve in flat:
-        if src_name != last_src:
-            body_lines.append('<b>—— %s ——</b>' % _esc(src_name))
-            last_src = src_name
-        body_lines.append(_render_entry(cve))
+    last_sources = None
+    for key, entry in flat:
+        cve = entry['cve']
+        src_label = ' / '.join(entry['sources'])
+        if src_label != last_sources:
+            body_lines.append('<b>—— %s ——</b>' % _esc(src_label))
+            last_sources = src_label
+        body_lines.append(_render_entry(cve, src_label))
+
+    total = len(merged)
 
     # ---- 单块组装（正常批次一条搞定） ----
     header = '<b>🛡 Threat Broadcast · %s</b>\n新增 <b>%d</b> 条' % (now, total)
