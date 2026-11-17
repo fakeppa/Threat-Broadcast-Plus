@@ -27,6 +27,7 @@ from src.crawler.cisa_kev import CisaKev
 import src.notice.page as page
 import src.notice.mail as mail
 import src.notice.wechat as wechat
+import src.notice.telegram as telegram
 import src.notice.kimi as kimi
 import src.utils._git as git
 
@@ -169,9 +170,10 @@ def run(options):
                 )
 
             if options['no_wechat']:
-                log.info('[微信] 已通过 --no-wechat 跳过')
+                log.info('[微信/Telegram] 已通过 --no-wechat 跳过')
             else:
                 wechat.to_wechat(all_cves)
+                telegram.to_telegram(all_cves)
 
             if options['auto_commit']:
                 git.auto_commit()

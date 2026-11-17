@@ -25,6 +25,9 @@ notify:
   wechat_webhook: "<%= ENV['WECHAT_WEBHOOK'] %>"      # 企业微信群机器人 Webhook
   serverchan_key: "<%= ENV['SERVERCHAN_KEY'] %>"      # Server酱 SendKey
   pushplus_token: "<%= ENV['PUSHPLUS_TOKEN'] %>"      # PushPlus Token
+  # Telegram 推送：Bot Token + 目标频道/群/私聊 chat_id
+  telegram_bot_token: "<%= ENV['TELEGRAM_BOT_TOKEN'] %>"
+  telegram_chat_id: "<%= ENV['TELEGRAM_CHAT_ID'] %>"
 
 kimi:
   api_key: "<%= ENV['KIMI_API_KEY'] %>"               # Kimi Code / Kimi API Key
