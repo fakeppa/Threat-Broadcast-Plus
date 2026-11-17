@@ -24,7 +24,6 @@ from src.logger import log
 PAGE_URL = 'https://threat.aabyss.cn/'
 MSG_LIMIT = 4096          # Telegram 单条上限
 SAFE_LIMIT = 3800         # 留余量给分片头尾
-MAX_AI_CHARS = 600
 SLEEP_BETWEEN = 0.6       # 分片间隔秒，防 429 限流
 
 BADGE = {
@@ -51,8 +50,16 @@ def to_telegram(cves):
         log.debug('[Telegram] 未配置推送渠道，跳过')
         return False
 
-    chunks = build_chunks(cves)
     sent_any = False
+
+    # ---- 消息 1：AI 研判全文（独立一条，不截断） ----
+    ai = _load_ai_summary()
+    if ai:
+        ai_msg = '<b>🤖 AI 研判 | 近期高风险漏洞</b>\n<blockquote>%s</blockquote>' % _esc(ai)
+        sent_any = _send(bot_token, chat_id, ai_msg) or sent_any
+
+    # ---- 消息 2..N：完整播报分片 ----
+    chunks = build_chunks(cves, with_ai=False)
     for idx, chunk in enumerate(chunks):
         ok = _send(bot_token, chat_id, chunk, seq=(idx + 1, len(chunks)))
         sent_any = sent_any or ok
@@ -71,7 +78,7 @@ def _load_ai_summary():
         with open(SUMMARY_PATH, 'r', encoding=config.CHARSET) as f:
             data = json.load(f)
         content = str(data.get('content') or '').strip()
-        return content[:MAX_AI_CHARS] if content else ''
+        return content if content else ''
     except (OSError, ValueError):
         return ''
 
@@ -92,8 +99,8 @@ def _fallback_url(cve):
     return ''
 
 
-def build_chunks(cves):
-    """渲染完整播报并按消息上限切成若干片。"""
+def build_chunks(cves, with_ai=True):
+    """渲染完整播报并按消息上限切成若干片。with_ai=False 时不内嵌研判（独立发送时用）。"""
     total = _total(cves)
     now = datetime.now(CST).strftime('%Y-%m-%d %H:%M')
 
@@ -102,10 +109,11 @@ def build_chunks(cves):
         '新增 <b>%d</b> 条 · %s' % (total, now),
     ]
 
-    ai = _load_ai_summary()
     ai_block = ''
-    if ai:
-        ai_block = '\n<blockquote>%s</blockquote>' % _esc(ai)
+    if with_ai:
+        ai = _load_ai_summary()
+        if ai:
+            ai_block = '\n<blockquote>%s</blockquote>' % _esc(ai)
 
     # ---- 全量条目按等级排序 ----
     flat = []
