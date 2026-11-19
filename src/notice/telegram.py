@@ -57,6 +57,10 @@ def _has_poc(cve):
     return bool(_POC_RE.search(text))
 
 
+MAX_CHUNKS = 5             # 单次推送最多 5 片（约 30-40 条全文），防爆频道
+HEADLINE_ONLY_AFTER = 25   # 超过 25 条后：重要级全文，其余只推编号+标题一行
+
+
 def to_telegram(cves):
     if not cves:
         return False
@@ -68,7 +72,19 @@ def to_telegram(cves):
         log.debug('[Telegram] 未配置推送渠道，跳过')
         return False
 
-    chunks = build_chunks(cves)
+    total_raw = _total(cves)
+    # 重启/首次运行会把全量当增量，条数超过阈值时降级为「重要全文 + 其余摘要」
+    compact = total_raw > HEADLINE_ONLY_AFTER
+    if compact:
+        log.info('[Telegram] 本次新增 %d 条超过 %d，启用紧凑模式' % (total_raw, HEADLINE_ONLY_AFTER))
+
+    chunks = build_chunks(cves, compact=compact)
+    # 硬上限：再多也只发前 MAX_CHUNKS 片，尾部提示看网页版
+    if len(chunks) > MAX_CHUNKS:
+        log.warning('[Telegram] 分片 %d 超上限 %d，截断' % (len(chunks), MAX_CHUNKS))
+        chunks = chunks[:MAX_CHUNKS]
+        chunks[-1] = chunks[-1].replace('🌐 网页版', '⚠️ 条目过多已截断，全部内容见 🌐 网页版')
+
     sent_any = False
     for idx, chunk in enumerate(chunks):
         ok = _send(bot_token, chat_id, chunk, seq=(idx + 1, len(chunks)))
@@ -131,7 +147,7 @@ def _fallback_url(cve):
     return ''
 
 
-def _render_entry(cve, src_label=''):
+def _render_entry(cve, src_label='', compact=False):
     level = (getattr(cve, 'level', '') or '').upper()
     badge = BADGE.get(level, '▫️')
     level_cn = LEVEL_CN.get(level, '未知')
@@ -142,6 +158,13 @@ def _render_entry(cve, src_label=''):
     cid = _esc(getattr(cve, 'id', '') or '详情')
     time_str = _esc((getattr(cve, 'time', '') or '')[:10])
     url = _fallback_url(cve)
+
+    # 紧凑模式：低优先级条目只推一行（编号+等级+标题）
+    important = level in ('KEV', 'CRITICAL', 'HIGH') or poc
+    if compact and not important:
+        if url:
+            return '<a href="%s">%s</a> %s [%s] %s' % (url, cid, badge, level_cn, title)
+        return '%s %s [%s] %s' % (cid, badge, level_cn, title)
 
     # 描述全文：normalize 上限 1200 字，这里只截到 900 控制单条体积
     info_raw = (getattr(cve, 'info', '') or '').strip()
@@ -202,8 +225,7 @@ def _merge_entries(cves):
     return merged
 
 
-def build_chunks(cves):
-    total_raw = _total(cves)
+def build_chunks(cves, compact=False):
     now = datetime.now(CST).strftime('%Y-%m-%d %H:%M')
 
     ai = _fetch_ai_from_page()
@@ -221,12 +243,14 @@ def build_chunks(cves):
         if src_label != last_sources:
             body_lines.append('<b>—— %s ——</b>' % _esc(src_label))
             last_sources = src_label
-        body_lines.append(_render_entry(cve, src_label))
+        body_lines.append(_render_entry(cve, src_label, compact=compact))
 
     total = len(merged)
 
     # ---- 单块组装（正常批次一条搞定） ----
     header = '<b>🛡 Threat Broadcast · %s</b>\n新增 <b>%d</b> 条' % (now, total)
+    if compact:
+        header += '（重要漏洞全文，其余仅标题）'
     if ai:
         header += '\n🤖 <b>AI 研判：</b>' + _esc(ai)
 
